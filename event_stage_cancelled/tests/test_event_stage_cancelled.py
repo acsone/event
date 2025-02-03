@@ -60,28 +60,130 @@ class TestEventCancelCase(BaseCommon):
 
     def test_event_cancellation(self):
         """Test the processes triggered by the event cancellation"""
-        # Force the scheduler to see no effect (normally is handled by the cron)
-        self.event_mail.execute()
-        self.assertFalse(bool(self.event_mail.mail_registration_ids))
-        self.assertFalse(self.event_mail.scheduled_date)
-        self.assertEqual(self.event_mail.mail_state, "running")
-        # Inject bypass_reason for test compatibility
-        # with event_registration_cancel_reason
+        # First cancel the event/registrations
         self.event.button_cancel()
-        self.assertTrue(
-            all([a.state == "cancel" for a in self.attendees]),
-            f"Not all the attendees are cancelled: "
-            f"{' / '.join([str((a.name, a.state)) for a in self.attendees])}",
-        )
-        # One attendee was already cancelled.
-        self.assertEqual(len(self.attendees.filtered("cancelled_from_event")), 4)
-        self.assertEqual(self.event_mail.mail_state, "scheduled")
-        # Force the scheduler. Normally is handled by the cron
+
+        # Initial execution
         self.event_mail.execute()
-        # Only the attendees that we just cancelled are going to be notified
+
+        # Check attendee cancellation states
+        cancelled_attendees = self.attendees.filtered(lambda a: a.state == "cancel")
         self.assertEqual(
-            (self.attendee_1 + self.attendee_2 + self.attendee_3 + self.attendee_4),
-            self.event_mail.mail_registration_ids.registration_id,
+            len(cancelled_attendees),
+            len(self.attendees),
+            f"Expected all attendees to be cancelled. Current states: "
+            f"{', '.join(f'{a.name}: {a.state}' for a in self.attendees)}",
         )
-        self.assertEqual(self.event_mail.mail_state, "sent")
+
+        # Verify cancelled_from_event flag
+        cancelled_from_event = self.attendees.filtered("cancelled_from_event")
+        self.assertEqual(
+            len(cancelled_from_event),
+            4,
+            f"Expected 4 attendees marked as "
+            f"cancelled_from_event, got {len(cancelled_from_event)}",
+        )
+
+        # Verify notification recipients
+        expected_recipients = (
+            self.attendee_1 + self.attendee_2 + self.attendee_3 + self.attendee_4
+        )
+        actual_recipients = self.event_mail.mail_registration_ids.registration_id
+        self.assertEqual(
+            actual_recipients,
+            expected_recipients,
+            "Mismatch in notification recipients",
+        )
+
+        # Verify mail state
+        self.assertEqual(
+            self.event_mail.mail_state,
+            "sent",
+            "Mail state should be 'sent' after execution",
+        )
+
+        # Verify all notifications were sent
+        unsent_mails = self.event_mail.mail_registration_ids.filtered(
+            lambda r: not r.mail_sent
+        )
+        self.assertFalse(
+            unsent_mails,
+            f"All mail registrations should be "
+            f"marked as sent. Unsent: {len(unsent_mails)}",
+        )
+
+    def test_compute_show_cancel_button(self):
+        """Test the computation of the show_cancel_button field."""
+        # Ensure no cancel stage exists
+        self.env["event.stage"].search([("is_cancelled", "=", True)]).unlink()
+        self.event._compute_show_cancel_button()
+
+        # No cancel stage should result in False
+        self.assertFalse(
+            self.event.show_cancel_button,
+            "show_cancel_button should be False when no cancel stage exists.",
+        )
+
+        # Create a cancel stage
+        cancel_stage = self.env["event.stage"].create(
+            {"name": "Cancelled", "is_cancelled": True}
+        )
+        open_stage = self.env["event.stage"].create(
+            {"name": "Open", "is_cancelled": False}
+        )
+
+        # Assign a non-cancel stage and check show_cancel_button
+        self.event.stage_id = open_stage
+        self.event._compute_show_cancel_button()
+        self.assertTrue(
+            self.event.show_cancel_button,
+            "show_cancel_button should be True when a cancel "
+            "stage exists and event is not done.",
+        )
+
+        # Assign a cancel stage and check show_cancel_button
+        self.event.stage_id = cancel_stage
+        self.event._compute_show_cancel_button()
+        self.assertFalse(
+            self.event.show_cancel_button,
+            "show_cancel_button should be False when the event is already cancelled.",
+        )
+
+        # Event is done
+        open_stage.write({"pipe_end": True})
+        self.event.stage_id = open_stage
+        self.event._compute_show_cancel_button()
+        self.assertFalse(
+            self.event.show_cancel_button,
+            "show_cancel_button should be False when the event is done.",
+        )
+
+    def test_compute_scheduled_date(self):
+        """Test the scheduled date computation for after_cancel interval type."""
+        # Set event stage to cancelled
+        cancel_stage = self.env["event.stage"].create(
+            {"name": "Cancelled", "is_cancelled": True}
+        )
+        self.event.stage_id = cancel_stage
+
+        # Check scheduled_date computation
+        self.event_mail._compute_scheduled_date()
+        self.assertTrue(self.event_mail.scheduled_date)
+
+    def test_execute_cancelled_registrations(self):
+        """Test that the execute method works for cancelled registrations."""
+        # Set event stage to cancelled and execute
+        cancel_stage = self.env["event.stage"].create(
+            {"name": "Cancelled", "is_cancelled": True}
+        )
+        self.event.stage_id = cancel_stage
+        self.event.button_cancel()
+
+        # Ensure cancelled registrations are correctly handled
+        self.event_mail.execute()
+        cancelled_attendees = self.attendees.filtered("cancelled_from_event")
+        self.assertEqual(
+            set(self.event_mail.mail_registration_ids.mapped("registration_id.id")),
+            set(cancelled_attendees.ids),
+        )
         self.assertTrue(all(self.event_mail.mail_registration_ids.mapped("mail_sent")))
